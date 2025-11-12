@@ -11,7 +11,7 @@ The goal of this assignment is to use consensus to build a fault-tolerant replic
 
 2. **Coordination server** (Zookeeper): A coordination protocol using Zookeeper as a logically centralized service accessible to all replicas;
 
-3. **Custom protocol (optional extra credit)** (Custom): Use an approach other than the above two to make your system fault-tolerant. Here are some suggestions: 1) Use an alternative consensus algorithm like Raft (many java implementations available online) in your server implementation; 2) Use a globally accessible logically centralized file system region or database for coordination, which is an option analogous to the Zookeeper option but using your own coordination service. If you use this approach and use cassandra itself as your coordination service, you must absolutely make sure that the coordination keyspace is completely isolated from the keyspace used by unit tests where safety critical state is maintained; 3) Implement your own fault-tolerant-consensus-based server-to-server protocol that is good enough to pass the tests. Note: Option #3 is not easy, but you may be able to do a good enough job to pass the tests without a complee and efficient implementation.
+3. **Custom protocol (optional extra credit)** (Custom): Use an approach other than the above two to make your system fault-tolerant. Here are some suggestions: 1) Use an alternative consensus algorithm like Raft (many java implementations available online) in your server implementation; 2) Use a globally accessible logically centralized file system region or database for coordination, which is an option analogous to the Zookeeper option but using your own coordination service. If you use this approach and use cassandra itself as your coordination service, you must absolutely make sure that the coordination keyspace is completely isolated from the keyspace used by unit tests where safety critical state is maintained; 3) Implement your own fault-tolerant-consensus-based server-to-server protocol that is good enough to pass the tests. Note: Option #3 is not easy, but you may be able to do a good enough job to pass the tests without a complete or efficient implementation.
 
 ### Prerequisites ###
 
@@ -21,7 +21,7 @@ The goal of this assignment is to use consensus to build a fault-tolerant replic
 
 3. Completion of [consensus and RSM tutorials (Part 1)](https://bitbucket.org/distrsys/consensus-rsm-tutorials/src/master/README.md?mode=edit&at=master).
 
-You are already familiar with the application environment and background here having completed prerequisite #2 above. The goal in this assignment is to make your previous replicated, consistent, non-fault-tolerant datastore fault-tolerant now using one of the three options listed in Goal above.
+You are already familiar with the application environment and background here having completed prerequisite #2 above. The goal in this assignment is to make your previous replicated, consistent, non-fault-tolerant datastore fault-tolerant now using at least two of the three options listed in Goal above.
 
 ***
 
