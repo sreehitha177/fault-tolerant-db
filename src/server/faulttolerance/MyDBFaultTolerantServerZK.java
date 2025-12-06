@@ -1,3 +1,344 @@
+//package server.faulttolerance;
+//
+//import edu.umass.cs.nio.nioutils.NIOHeader;
+//import edu.umass.cs.nio.nioutils.NodeConfigUtils;
+//import edu.umass.cs.nio.interfaces.NodeConfig;
+//import edu.umass.cs.utils.Util;
+//import server.MyDBSingleServer;
+//import server.ReplicatedServer;
+//
+//import com.datastax.driver.core.Cluster;
+//import com.datastax.driver.core.Session;
+//import org.apache.zookeeper.*;
+//import org.apache.zookeeper.data.Stat;
+//import org.json.JSONException;
+//import org.json.JSONObject;
+//
+//import java.io.IOException;
+//import java.net.InetSocketAddress;
+//import java.nio.charset.StandardCharsets;
+//import java.util.*;
+//import java.util.concurrent.CountDownLatch;
+//import java.util.logging.Level;
+//import java.util.logging.Logger;
+//import java.util.Base64;
+//
+//public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watcher {
+//	private static final Logger log = Logger.getLogger(MyDBFaultTolerantServerZK.class.getName());
+//
+//	public static final int SLEEP = 1000;
+//	public static final boolean DROP_TABLES_AFTER_TESTS = true;
+//	public static final int MAX_LOG_SIZE = 400;
+//
+//	private static final String ZK_CONNECT_DEFAULT = "127.0.0.1:2181";
+//	private static final int ZK_SESSION_TIMEOUT = 30000;
+//	private static final String OPS_ROOT = "/operations";
+//	private static final String CKPT_ROOT = "/checkpoints";
+//	private static final String OP_PREFIX = "op-";
+//
+//	private final Cluster cluster;
+//	private final Session session;
+//	private final String myID;
+//
+//	private final ZooKeeper zk;
+//	private final String zkConnectString;
+//
+//	private long lastApplied = -1L;
+//
+//	private final LinkedHashMap<Long, String> logCache = new LinkedHashMap<Long, String>() {
+//		@Override
+//		protected boolean removeEldestEntry(Map.Entry<Long, String> eldest) {
+//			return size() > MAX_LOG_SIZE;
+//		}
+//	};
+//
+//	private final Object processLock = new Object();
+//
+//	public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig, String myID, InetSocketAddress isaDB) throws IOException {
+//		super(new InetSocketAddress(nodeConfig.getNodeAddress(myID),
+//						nodeConfig.getNodePort(myID) - ReplicatedServer.SERVER_PORT_OFFSET),
+//				isaDB, myID);
+//
+//		this.myID = myID;
+//
+//		// Cassandra init
+//		String contactPoint = isaDB.getAddress().getHostAddress();
+//		log.log(Level.INFO, "Connecting to Cassandra contact point {0}, keyspace {1}", new Object[]{contactPoint, myID});
+//		this.cluster = Cluster.builder().addContactPoint(contactPoint).build();
+//		this.session = cluster.connect(myID);
+//
+//		// ZooKeeper init
+//		this.zkConnectString = ZK_CONNECT_DEFAULT;
+//		try {
+//			CountDownLatch connectedSignal = new CountDownLatch(1);
+//			this.zk = new ZooKeeper(this.zkConnectString, ZK_SESSION_TIMEOUT, event -> {
+//				if (event.getState() == Event.KeeperState.SyncConnected) {
+//					connectedSignal.countDown();
+//				}
+//				process(event);
+//			});
+//			connectedSignal.await();
+//
+//			ensurePathExists(OPS_ROOT);
+//			ensurePathExists(CKPT_ROOT);
+//			ensurePathExists(CKPT_ROOT + "/" + myID);
+//
+//			recoverFromCheckpoint();
+//
+//			replayUnappliedOperations();
+//
+//			new Thread(() -> {
+//				try {
+//					Thread.sleep(2L * SLEEP);
+//					try {
+//						replayUnappliedOperations();
+//					} catch (KeeperException | InterruptedException e) {
+//						log.log(Level.WARNING, "Background replay failed: {0}", e.getMessage());
+//					}
+//				} catch (InterruptedException ie) {
+//					Thread.currentThread().interrupt();
+//				}
+//			}, "ZK-Replay-SafetyNet-" + myID).start();
+//
+//			log.log(Level.INFO, "MyDBFaultTolerantServerZK {0} started: zk={1}", new Object[]{myID, zkConnectString});
+//
+//		} catch (InterruptedException ie) {
+//			Thread.currentThread().interrupt();
+//			throw new IOException("Interrupted waiting for ZooKeeper connection", ie);
+//		} catch (KeeperException ke) {
+//			throw new IOException("Failed to initialize ZooKeeper: " + ke.getMessage(), ke);
+//		} catch (Exception e) {
+//			throw new IOException("Failed to initialize ZooKeeper: " + e.getMessage(), e);
+//		}
+//	}
+//
+//	private void ensurePathExists(String path) throws KeeperException, InterruptedException {
+//		String[] parts = path.split("/");
+//		String cur = "";
+//		for (String p : parts) {
+//			if (p.length() == 0) continue;
+//			cur = cur + "/" + p;
+//			Stat s = zk.exists(cur, false);
+//			if (s == null) {
+//				try {
+//					zk.create(cur, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+//				} catch (KeeperException.NodeExistsException ignore) {}
+//			}
+//		}
+//	}
+//
+//	@Override
+//	protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
+//		String reqStr = new String(bytes, StandardCharsets.UTF_8);
+//		try {
+//			List<String> children = zk.getChildren(OPS_ROOT, false);
+//			if (children.size() >= MAX_LOG_SIZE) {
+//				this.clientMessenger.send(header.sndr, "[ERROR: queue-full]".getBytes(StandardCharsets.UTF_8));
+//				return;
+//			}
+//
+//			byte[] data = reqStr.getBytes(StandardCharsets.UTF_8);
+//			zk.create(OPS_ROOT + "/" + OP_PREFIX, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_SEQUENTIAL);
+//
+//			this.clientMessenger.send(header.sndr, ("[success:" + reqStr + "]").getBytes(StandardCharsets.UTF_8));
+//
+//		} catch (KeeperException | InterruptedException | IOException e) {
+//			try {
+//				this.clientMessenger.send(header.sndr, "[ERROR:failed]".getBytes(StandardCharsets.UTF_8));
+//			} catch (IOException ignored) {}
+//			log.log(Level.SEVERE, "Error handling client request: {0}", e.getMessage());
+//		}
+//	}
+//
+//	protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {}
+//
+//	@Override
+//	public void process(WatchedEvent event) {
+//		if (event == null) return;
+//		try {
+//			if (event.getType() == Event.EventType.NodeChildrenChanged && OPS_ROOT.equals(event.getPath())) {
+//				replayUnappliedOperations();
+//			}
+//			if (event.getState() == Event.KeeperState.Expired) {
+//				log.log(Level.WARNING, "ZooKeeper session expired, restart may be required.");
+//			}
+//		} catch (Exception e) {
+//			log.log(Level.SEVERE, "Error in watcher process: {0}", e.getMessage());
+//		}
+//	}
+//
+//	private void replayUnappliedOperations() throws KeeperException, InterruptedException {
+//		synchronized (processLock) {
+//			List<String> children = zk.getChildren(OPS_ROOT, this);
+//			if (children == null || children.isEmpty()) return;
+//			Collections.sort(children);
+//
+//			for (String child : children) {
+//				long seq = seqFromName(child);
+//				if (seq <= lastApplied) continue;
+//				String path = OPS_ROOT + "/" + child;
+//
+//				Stat s = zk.exists(path, false);
+//				if (s == null) continue;
+//				byte[] data = zk.getData(path, false, s);
+//				if (data == null) continue;
+//				String reqStr = new String(data, StandardCharsets.UTF_8);
+//
+//				boolean ok = applyRequestToCassandra(reqStr);
+//				if (ok) {
+//					lastApplied = seq;
+//					synchronized (logCache) { logCache.put(seq, reqStr); }
+//					if (logCache.size() >= MAX_LOG_SIZE) checkpoint();
+//				} else {
+//					break;
+//				}
+//			}
+//		}
+//	}
+//
+//	private long seqFromName(String child) {
+//		String name = child.contains("/") ? child.substring(child.lastIndexOf('/') + 1) : child;
+//		int dash = name.lastIndexOf('-');
+//		if (dash < 0 || dash + 1 >= name.length()) return Long.MAX_VALUE;
+//		try { return Long.parseLong(name.substring(dash + 1)); }
+//		catch (NumberFormatException e) { return Long.MAX_VALUE; }
+//	}
+//
+//	private boolean applyRequestToCassandra(String requestString) {
+//		try {
+//			String cql;
+//			try {
+//				JSONObject json = new JSONObject(requestString);
+//				if (json.has("request")) cql = json.getString("request");
+//				else if (json.has("REQUEST")) cql = json.getString("REQUEST");
+//				else if (json.has("req")) cql = json.getString("req");
+//				else if (json.has("cql")) cql = json.getString("cql");
+//				else cql = requestString;
+//			} catch (JSONException je) { cql = requestString; }
+//
+//			session.execute(cql);
+//			return true;
+//		} catch (Exception e) {
+//			log.log(Level.SEVERE, "Cassandra application error: {0}", e.getMessage());
+//			return false;
+//		}
+//	}
+//
+//	private void checkpoint() throws KeeperException, InterruptedException {
+//		synchronized (processLock) {
+//			String ckptPath = CKPT_ROOT + "/" + myID;
+//			StringBuilder sb = new StringBuilder();
+//			sb.append("lastApplied=").append(lastApplied).append('\n');
+//			synchronized (logCache) {
+//				for (Map.Entry<Long, String> e : logCache.entrySet()) {
+//					long seq = e.getKey();
+//					if (seq > lastApplied) continue;
+//					sb.append(seq).append('|')
+//							.append(Base64.getEncoder().encodeToString(e.getValue().getBytes(StandardCharsets.UTF_8)))
+//							.append('\n');
+//				}
+//			}
+//
+//			byte[] snapshotBytes = sb.toString().getBytes(StandardCharsets.UTF_8);
+//
+//			Stat s = zk.exists(ckptPath, false);
+//			if (s != null) zk.setData(ckptPath, snapshotBytes, -1);
+//			else { ensurePathExists(ckptPath); zk.setData(ckptPath, snapshotBytes, -1); }
+//
+//			List<String> children = zk.getChildren(OPS_ROOT, false);
+//			if (children != null) {
+//				for (String child : children) {
+//					long seq = seqFromName(child);
+//					if (seq <= lastApplied) {
+//						try { zk.delete(OPS_ROOT + "/" + child, -1); }
+//						catch (KeeperException.NoNodeException | KeeperException.NotEmptyException ignore) {}
+//					}
+//				}
+//			}
+//		}
+//	}
+//
+//	private void recoverFromCheckpoint() {
+//		try {
+//			String ckptPath = CKPT_ROOT + "/" + myID;
+//			Stat s = zk.exists(ckptPath, false);
+//			if (s == null) return;
+//
+//			byte[] data = zk.getData(ckptPath, false, s);
+//			if (data == null || data.length == 0) return;
+//
+//			String sstr = new String(data, StandardCharsets.UTF_8);
+//			String[] lines = sstr.split("\\r?\\n");
+//
+//			if (lines.length == 0) return;
+//
+//			long parsedLast = -1L;
+//			String first = lines[0].trim();
+//			if (first.startsWith("lastApplied=")) {
+//				try { parsedLast = Long.parseLong(first.substring("lastApplied=".length()).trim()); }
+//				catch (NumberFormatException nfe) { parsedLast = -1L; }
+//			} else {
+//				try { parsedLast = Long.parseLong(first.trim()); } catch (NumberFormatException nfe) { parsedLast = -1L; }
+//			}
+//			if (parsedLast >= 0) lastApplied = parsedLast;
+//
+//			if (lines.length > 1) {
+//				TreeMap<Long, String> restored = new TreeMap<>();
+//				for (int i = 1; i < lines.length; i++) {
+//					String ln = lines[i].trim();
+//					if (ln.isEmpty()) continue;
+//					int sep = ln.indexOf('|');
+//					if (sep <= 0) continue;
+//					try {
+//						long seq = Long.parseLong(ln.substring(0, sep));
+//						byte[] payloadBytes = Base64.getDecoder().decode(ln.substring(sep + 1));
+//						restored.put(seq, new String(payloadBytes, StandardCharsets.UTF_8));
+//					} catch (Exception ignored) {}
+//				}
+//
+//				if (!restored.isEmpty()) {
+//					synchronized (logCache) { logCache.clear(); logCache.putAll(restored); }
+//
+//					// Restore ZK log entries for replay
+//					for (Map.Entry<Long, String> e : restored.entrySet()) {
+//						long seq = e.getKey();
+//						String payload = e.getValue();
+//						String zkPath = OPS_ROOT + "/" + OP_PREFIX + String.format("%010d", seq);
+//						Stat exists = zk.exists(zkPath, false);
+//						if (exists == null) {
+//							zk.create(zkPath, payload.getBytes(StandardCharsets.UTF_8),
+//									ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+//						}
+//					}
+//					// Trigger replay
+//					replayUnappliedOperations();
+//				}
+//			}
+//
+//			log.log(Level.INFO, "Recovered checkpoint: lastApplied={0}", lastApplied);
+//
+//		} catch (Exception e) {
+//			log.log(Level.WARNING, "Failed to recover checkpoint: {0}", e.getMessage());
+//		}
+//	}
+//
+//	@Override
+//	public void close() {
+//		super.close();
+//		try { if (zk != null) zk.close(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+//		try { if (session != null) session.close(); } catch (Exception ignored) {}
+//		try { if (cluster != null) cluster.close(); } catch (Exception ignored) {}
+//		log.log(Level.INFO, "MyDBFaultTolerantServerZK {0} closed", myID);
+//	}
+//
+//	public static void main(String[] args) throws IOException {
+//		NodeConfig<String> nc = NodeConfigUtils.getNodeConfigFromFile(args[0], ReplicatedServer.SERVER_PREFIX, ReplicatedServer.SERVER_PORT_OFFSET);
+//		String myID = args[1];
+//		InetSocketAddress isaDB = args.length > 2 ? Util.getInetSocketAddressFromString(args[2]) : new InetSocketAddress("localhost", 9042);
+//		new MyDBFaultTolerantServerZK(nc, myID, isaDB);
+//	}
+//}
+
 package server.faulttolerance;
 
 import edu.umass.cs.nio.nioutils.NIOHeader;
@@ -18,48 +359,35 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.Base64;
 
-/**
- * Zookeeper-based fault-tolerant replicated server.
- *
- * - client request -> create PERSISTENT_SEQUENTIAL znode under /operations
- * - each replica watches /operations and applies ops in order
- * - checkpointing trims old znodes to keep <= MAX_LOG_SIZE
- *
- * Notes:
- * - The grader expects the public static constants SLEEP, DROP_TABLES_AFTER_TESTS, MAX_LOG_SIZE.
- */
 public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watcher {
-	private static final Logger log = Logger.getLogger(server.faulttolerance.MyDBFaultTolerantServerZK.class.getName());
+	private static final Logger log = Logger.getLogger(MyDBFaultTolerantServerZK.class.getName());
 
-	/* Required public static constants the grader references */
 	public static final int SLEEP = 1000;
 	public static final boolean DROP_TABLES_AFTER_TESTS = true;
-	public static final int MAX_LOG_SIZE = 400; // assignment limit; adjust if grader requires a different value
+	public static final int MAX_LOG_SIZE = 400;
 
-	/* ZooKeeper configuration */
 	private static final String ZK_CONNECT_DEFAULT = "127.0.0.1:2181";
 	private static final int ZK_SESSION_TIMEOUT = 30000;
 	private static final String OPS_ROOT = "/operations";
 	private static final String CKPT_ROOT = "/checkpoints";
 	private static final String OP_PREFIX = "op-";
 
-	/* Cassandra */
 	private final Cluster cluster;
 	private final Session session;
 	private final String myID;
 
-	/* ZooKeeper client */
 	private final ZooKeeper zk;
 	private final String zkConnectString;
 
-	/* replication state */
-	private long lastApplied = -1L; // sequence number of last applied op
+	private long lastApplied = -1L;
+	private int operationsSinceLastCheckpoint = 0;
+	private static final int CHECKPOINT_INTERVAL = 50;
 
-	// bounded in-memory log (sequence -> request string). evicts oldest when size > MAX_LOG_SIZE
 	private final LinkedHashMap<Long, String> logCache = new LinkedHashMap<Long, String>() {
 		@Override
 		protected boolean removeEldestEntry(Map.Entry<Long, String> eldest) {
@@ -68,15 +396,12 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 	};
 
 	private final Object processLock = new Object();
+	private volatile boolean recovering = false;
 
-	/**
-	 * Constructor.
-	 *
-	 * @param nodeConfig Node configuration read from servers.properties
-	 * @param myID       keyspace/server id (also Cassandra keyspace to connect to)
-	 * @param isaDB      socket address of backend datastore (Cassandra)
-	 * @throws IOException
-	 */
+	private final Map<Long, CountDownLatch> completionLatches = new ConcurrentHashMap<>();
+
+	private final ScheduledExecutorService checkpointExecutor = Executors.newSingleThreadScheduledExecutor();
+
 	public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig, String myID, InetSocketAddress isaDB) throws IOException {
 		super(new InetSocketAddress(nodeConfig.getNodeAddress(myID),
 						nodeConfig.getNodePort(myID) - ReplicatedServer.SERVER_PORT_OFFSET),
@@ -84,68 +409,66 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 
 		this.myID = myID;
 
-		// --- Cassandra init (reuse PA2 style) ---
+		// Cassandra init
 		String contactPoint = isaDB.getAddress().getHostAddress();
-		log.log(Level.INFO, "Connecting to Cassandra contact point {0}, keyspace {1}", new Object[]{contactPoint, myID});
+		System.out.println("[INIT] " + myID + " connecting to Cassandra at " + contactPoint);
 		this.cluster = Cluster.builder().addContactPoint(contactPoint).build();
-		this.session = cluster.connect(myID); // keyspace is myID as per assignment
+		this.session = cluster.connect(myID);
 
-		// --- ZooKeeper init ---
+		// ZooKeeper init
 		this.zkConnectString = ZK_CONNECT_DEFAULT;
 		try {
 			CountDownLatch connectedSignal = new CountDownLatch(1);
 			this.zk = new ZooKeeper(this.zkConnectString, ZK_SESSION_TIMEOUT, event -> {
-				// Basic connect latch
 				if (event.getState() == Event.KeeperState.SyncConnected) {
 					connectedSignal.countDown();
 				}
-				// Delegate to instance watcher
 				process(event);
 			});
-			// Wait for connection
 			connectedSignal.await();
+			System.out.println("[INIT] " + myID + " connected to ZooKeeper");
 
-			// Ensure root znodes exist (be tolerant of concurrent creation)
 			ensurePathExists(OPS_ROOT);
 			ensurePathExists(CKPT_ROOT);
-			ensurePathExists(CKPT_ROOT + "/" + myID);
 
-			// Recover and replay any unapplied operations
+			// Recovery phase
+			recovering = true;
 			recoverFromCheckpoint();
-			// Ensure watching and initial replay
-			// Use getChildren with watcher to arm it
+
+			// Check what's in ZooKeeper
+			List<String> opsInZk = zk.getChildren(OPS_ROOT, false);
+			System.out.println("[INIT] " + myID + " found " + opsInZk.size() + " operations in ZooKeeper");
+
 			replayUnappliedOperations();
+			recovering = false;
 
-			// Periodic replay thread
-			new Thread(() -> {
-				while (true) {
-					try {
-						replayUnappliedOperations();
-						Thread.sleep(500);
-					} catch (Exception e) {
-						log.log(Level.WARNING, "Periodic replay failed: {0}", e.getMessage());
+			// Periodic checkpointing
+			checkpointExecutor.scheduleAtFixedRate(() -> {
+				try {
+					if (operationsSinceLastCheckpoint > 0) {
+						synchronized (processLock) {
+							checkpoint();
+						}
 					}
+				} catch (Exception e) {
+					System.err.println("[CHECKPOINT] " + myID + " periodic checkpoint failed: " + e.getMessage());
 				}
-			}, "ReplayThread-" + myID).start();
+			}, 2, 2, TimeUnit.SECONDS);
 
-			log.log(Level.INFO, "MyDBFaultTolerantServerZK {0} started: zk={1}", new Object[]{myID, zkConnectString});
+			System.out.println("[INIT] " + myID + " ready, lastApplied=" + lastApplied);
 
 		} catch (InterruptedException ie) {
 			Thread.currentThread().interrupt();
 			throw new IOException("Interrupted waiting for ZooKeeper connection", ie);
 		} catch (KeeperException ke) {
-			// Be tolerant: NodeExists exceptions inside ensurePathExists are handled, but higher level exceptions bubble here.
 			throw new IOException("Failed to initialize ZooKeeper: " + ke.getMessage(), ke);
 		} catch (Exception e) {
 			throw new IOException("Failed to initialize ZooKeeper: " + e.getMessage(), e);
 		}
 	}
 
-	/**
-	 * Ensure a znode path exists; create persistent if missing. Tolerant to concurrent creation.
-	 */
 	private void ensurePathExists(String path) throws KeeperException, InterruptedException {
-		// create path components iteratively and ignore node-exists races
+		if (path == null || path.isEmpty()) return;
 		String[] parts = path.split("/");
 		String cur = "";
 		for (String p : parts) {
@@ -155,174 +478,150 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 			if (s == null) {
 				try {
 					zk.create(cur, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-				} catch (KeeperException.NodeExistsException ignore) {
-					// someone else created it concurrently — OK
-				}
+					System.out.println("[ZK] " + myID + " created path: " + cur);
+				} catch (KeeperException.NodeExistsException ignore) {}
 			}
 		}
 	}
 
-	/**
-	 * Handle bytes from clients: create a persistent-sequential znode under /operations.
-	 * Return an immediate ack to client.
-	 */
 	@Override
 	protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
 		String reqStr = new String(bytes, StandardCharsets.UTF_8);
 		try {
-			// Check ZK children count to avoid exceeding MAX_LOG_SIZE
-			List<String> children = zk.getChildren(OPS_ROOT, false);
-			if (children.size() >= MAX_LOG_SIZE) {
-				String err = "[ERROR: queue-full]";
-				try {
-					this.clientMessenger.send(header.sndr, err.getBytes(StandardCharsets.UTF_8));
-				} catch (IOException ioe) {
-					log.log(Level.WARNING, "Failed to send queue-full response to client: {0}", ioe.getMessage());
-				}
-				return;
-			}
-
-			// create persistent sequential znode with request data
+			// Write to ZooKeeper
 			byte[] data = reqStr.getBytes(StandardCharsets.UTF_8);
-			String created = null;
-			try {
-				created = zk.create(OPS_ROOT + "/" + OP_PREFIX, data,
-						ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_SEQUENTIAL);
-			} catch (KeeperException.NodeExistsException nee) {
-				// unlikely for create of sequential node, but handle defensively
-				log.log(Level.WARNING, "NodeExists when creating op node (ignored): {0}", nee.getMessage());
-				// attempt to continue (we could re-try but for simplicity let watcher handle)
+			String createdPath = zk.create(OPS_ROOT + "/" + OP_PREFIX, data,
+					ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT_SEQUENTIAL);
+
+			long seq = seqFromName(createdPath);
+			System.out.println("[CLIENT] " + myID + " created operation: " + createdPath + " (seq=" + seq + ")");
+
+			// Wait for application
+			CountDownLatch latch = new CountDownLatch(1);
+			completionLatches.put(seq, latch);
+
+			replayUnappliedOperations();
+
+			boolean applied = latch.await(10, TimeUnit.SECONDS);
+			completionLatches.remove(seq);
+
+			if (applied) {
+				System.out.println("[CLIENT] " + myID + " completed operation seq=" + seq);
+				this.clientMessenger.send(header.sndr, ("[success:" + reqStr + "]").getBytes(StandardCharsets.UTF_8));
+			} else {
+				System.err.println("[CLIENT] " + myID + " TIMEOUT on operation seq=" + seq);
+				this.clientMessenger.send(header.sndr, "[ERROR:timeout]".getBytes(StandardCharsets.UTF_8));
 			}
 
-			log.log(Level.INFO, "Client request created znode {0} : {1}", new Object[]{created, reqStr});
-
-			// immediate asynchronous response to client; the grader often expects async ack.
-			String response = "[success:" + reqStr + "]";
-			this.clientMessenger.send(header.sndr, response.getBytes(StandardCharsets.UTF_8));
-
-			// No need to explicitly trigger replay — watcher on ops will see new child.
-
-		} catch (KeeperException | InterruptedException | IOException e) {
-			log.log(Level.SEVERE, "Error handling client request: {0}", e.getMessage());
+		} catch (Exception e) {
 			try {
-				String err = "[ERROR:failed]";
-				this.clientMessenger.send(header.sndr, err.getBytes(StandardCharsets.UTF_8));
-			} catch (IOException ioe) {
-				log.log(Level.WARNING, "Failed to send error response to client: {0}", ioe.getMessage());
-			}
+				this.clientMessenger.send(header.sndr, "[ERROR:failed]".getBytes(StandardCharsets.UTF_8));
+			} catch (IOException ignored) {}
+			System.err.println("[CLIENT] " + myID + " error: " + e.getMessage());
+			e.printStackTrace();
 		}
 	}
 
-	/**
-	 * We don't use server-to-server messaging for ordering (ZK does ordering).
-	 * Keep method for compatibility — no-op.
-	 */
-	protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {
-		log.log(Level.FINER, "Received a server message (ignored) from {0}", header.sndr);
-	}
+	protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {}
 
-	/**
-	 * Watcher callback entry. Re-arm when children change.
-	 */
 	@Override
 	public void process(WatchedEvent event) {
 		if (event == null) return;
 		try {
 			if (event.getType() == Event.EventType.NodeChildrenChanged && OPS_ROOT.equals(event.getPath())) {
-				// children changed under /operations -> replay unapplied ops
-				replayUnappliedOperations();
-			}
-			// also handle session reconnects or expirations if needed
-			if (event.getState() == Event.KeeperState.Expired) {
-				log.log(Level.WARNING, "ZooKeeper session expired, application may need restart.");
+				System.out.println("[WATCH] " + myID + " detected children changed");
+				if (!recovering) {
+					replayUnappliedOperations();
+				}
 			}
 		} catch (Exception e) {
-			log.log(Level.SEVERE, "Error in watcher process: {0}", e.getMessage());
+			System.err.println("[WATCH] " + myID + " error: " + e.getMessage());
 		}
 	}
 
-	/**
-	 * Replay any operations in ZK that have seq > lastApplied. Applies them
-	 * deterministically in increasing sequence order. Always re-arm watcher.
-	 */
 	private void replayUnappliedOperations() throws KeeperException, InterruptedException {
 		synchronized (processLock) {
-			try {
-				// arm watcher while fetching children so we get next event
-				List<String> children = zk.getChildren(OPS_ROOT, this);
-				if (children == null || children.isEmpty()) {
-					return;
+			List<String> children = zk.getChildren(OPS_ROOT, true);
+			if (children == null || children.isEmpty()) {
+				System.out.println("[REPLAY] " + myID + " no operations to replay");
+				return;
+			}
+
+			Collections.sort(children);
+			System.out.println("[REPLAY] " + myID + " found " + children.size() + " operations, lastApplied=" + lastApplied);
+
+			int appliedCount = 0;
+			for (String child : children) {
+				long seq = seqFromName(child);
+				if (seq <= lastApplied) {
+					continue;
 				}
-				Collections.sort(children); // lexicographic works with sequential suffixes
 
-				for (String child : children) {
-					long seq = seqFromName(child);
-					if (seq <= lastApplied) continue; // already applied
-					String path = OPS_ROOT + "/" + child;
-
-					// read data
+				String path = OPS_ROOT + "/" + child;
+				try {
 					Stat s = zk.exists(path, false);
 					if (s == null) {
-						// node might have been deleted already by checkpoint or another replica
+						System.out.println("[REPLAY] " + myID + " path disappeared: " + path);
 						continue;
 					}
+
 					byte[] data = zk.getData(path, false, s);
-					if (data == null) continue;
+					if (data == null || data.length == 0) {
+						System.err.println("[REPLAY] " + myID + " empty data at: " + path);
+						continue;
+					}
+
 					String reqStr = new String(data, StandardCharsets.UTF_8);
 
-					// apply to Cassandra
-					boolean ok = applyRequestToCassandra(reqStr);
-					if (ok) {
+					boolean success = applyRequestToCassandra(reqStr);
+					if (success) {
 						lastApplied = seq;
 						synchronized (logCache) {
 							logCache.put(seq, reqStr);
 						}
-						// if cache reached limit, checkpoint and trim znodes
-						if (logCache.size() >= MAX_LOG_SIZE) {
-							try {
-								checkpoint();
-							} catch (Exception e) {
-								log.log(Level.SEVERE, "Checkpoint failed: {0}", e.getMessage());
-							}
+						operationsSinceLastCheckpoint++;
+						appliedCount++;
+
+						// Signal completion
+						CountDownLatch latch = completionLatches.get(seq);
+						if (latch != null) {
+							latch.countDown();
+						}
+
+						// Checkpoint periodically
+						if (operationsSinceLastCheckpoint >= CHECKPOINT_INTERVAL) {
+							checkpoint();
 						}
 					} else {
-						log.log(Level.SEVERE, "Failed to apply request seq {0}: {1}", new Object[]{seq, reqStr});
-						// do not advance lastApplied; leave znode for retry
-						break;
+						System.err.println("[REPLAY] " + myID + " failed to apply seq=" + seq);
 					}
+				} catch (KeeperException.NoNodeException e) {
+					System.err.println("[REPLAY] " + myID + " node deleted: " + path);
 				}
-			} finally {
-				// ensure watcher stays installed (redundant, but safe)
-				try {
-					zk.getChildren(OPS_ROOT, this);
-				} catch (KeeperException | InterruptedException e) {
-					log.log(Level.WARNING, "Failed to re-arm watcher on OPS_ROOT: {0}", e.getMessage());
-				}
+			}
+
+			if (appliedCount > 0) {
+				System.out.println("[REPLAY] " + myID + " applied " + appliedCount + " operations, lastApplied now=" + lastApplied);
 			}
 		}
 	}
 
-	/**
-	 * Parse sequential suffix from znode name like "op-0000000001" -> 1
-	 */
 	private long seqFromName(String child) {
-		int dash = child.lastIndexOf('-');
-		if (dash < 0 || dash + 1 >= child.length()) return Long.MAX_VALUE;
-		String num = child.substring(dash + 1);
+		String name = child.contains("/") ? child.substring(child.lastIndexOf('/') + 1) : child;
+		int dash = name.lastIndexOf('-');
+		if (dash < 0 || dash + 1 >= name.length()) {
+			return Long.MAX_VALUE;
+		}
 		try {
-			return Long.parseLong(num);
+			return Long.parseLong(name.substring(dash + 1));
 		} catch (NumberFormatException e) {
 			return Long.MAX_VALUE;
 		}
 	}
 
-	/**
-	 * Apply a request string to Cassandra. Accepts raw CQL or a JSON envelope.
-	 * Returns true on success.
-	 */
 	private boolean applyRequestToCassandra(String requestString) {
 		try {
-			String cql = null;
+			String cql;
 			try {
 				JSONObject json = new JSONObject(requestString);
 				if (json.has("request")) cql = json.getString("request");
@@ -335,103 +634,181 @@ public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watch
 			}
 
 			session.execute(cql);
-			log.log(Level.FINER, "Applied to Cassandra: {0}", cql);
 			return true;
 		} catch (Exception e) {
-			log.log(Level.SEVERE, "Cassandra application error: {0}", e.getMessage());
+			System.err.println("[CASSANDRA] " + myID + " error: " + e.getMessage());
 			return false;
 		}
 	}
 
-	/**
-	 * Create a checkpoint (persist lastApplied in ZK) and trim older op znodes up to lastApplied.
-	 */
 	private void checkpoint() throws KeeperException, InterruptedException {
-		synchronized (processLock) {
-			String ckptPath = CKPT_ROOT + "/" + myID;
-			byte[] data = Long.toString(lastApplied).getBytes(StandardCharsets.UTF_8);
-			Stat s = zk.exists(ckptPath, false);
-			if (s != null) {
-				zk.setData(ckptPath, data, -1);
-			} else {
-				ensurePathExists(ckptPath);
-				zk.setData(ckptPath, data, -1);
-			}
-			log.log(Level.INFO, "Checkpoint saved for {0}: lastApplied={1}", new Object[]{myID, lastApplied});
+		String ckptPath = CKPT_ROOT + "/" + myID;
 
-			// trim znodes <= lastApplied
+		ensurePathExists(ckptPath);
+
+		StringBuilder sb = new StringBuilder();
+		sb.append("lastApplied=").append(lastApplied).append('\n');
+
+		synchronized (logCache) {
+			for (Map.Entry<Long, String> e : logCache.entrySet()) {
+				long seq = e.getKey();
+				if (seq > lastApplied) continue;
+				sb.append(seq).append('|')
+						.append(Base64.getEncoder().encodeToString(e.getValue().getBytes(StandardCharsets.UTF_8)))
+						.append('\n');
+			}
+		}
+
+		byte[] snapshotBytes = sb.toString().getBytes(StandardCharsets.UTF_8);
+
+		Stat s = zk.exists(ckptPath, false);
+		if (s != null) {
+			zk.setData(ckptPath, snapshotBytes, -1);
+		} else {
+			zk.create(ckptPath, snapshotBytes, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+		}
+
+		operationsSinceLastCheckpoint = 0;
+		System.out.println("[CHECKPOINT] " + myID + " saved checkpoint, lastApplied=" + lastApplied + ", cache size=" + logCache.size());
+
+		// Delete old operations
+		long safeDeleteBefore = lastApplied - (MAX_LOG_SIZE * 3);
+		if (safeDeleteBefore > 0) {
 			List<String> children = zk.getChildren(OPS_ROOT, false);
+			int deleted = 0;
 			if (children != null) {
 				for (String child : children) {
 					long seq = seqFromName(child);
-					if (seq <= lastApplied) {
-						String path = OPS_ROOT + "/" + child;
+					if (seq < safeDeleteBefore) {
 						try {
-							zk.delete(path, -1);
-						} catch (KeeperException.NoNodeException nne) {
-							// already deleted by other replica
-						} catch (KeeperException.NotEmptyException nee) {
-							// shouldn't happen; ignore
-						}
+							zk.delete(OPS_ROOT + "/" + child, -1);
+							deleted++;
+						} catch (Exception ignore) {}
 					}
 				}
+			}
+			if (deleted > 0) {
+				System.out.println("[CHECKPOINT] " + myID + " deleted " + deleted + " old operations");
 			}
 		}
 	}
 
-	/**
-	 * Recover lastApplied from checkpoint on startup.
-	 */
 	private void recoverFromCheckpoint() {
 		try {
 			String ckptPath = CKPT_ROOT + "/" + myID;
 			Stat s = zk.exists(ckptPath, false);
-			if (s != null) {
-				byte[] data = zk.getData(ckptPath, false, s);
-				if (data != null && data.length > 0) {
-					String sstr = new String(data, StandardCharsets.UTF_8);
+			if (s == null) {
+				System.out.println("[RECOVER] " + myID + " no checkpoint found, will replay all from ZooKeeper");
+				// No checkpoint - will start from beginning
+				lastApplied = -1L;
+				return;
+			}
+
+			byte[] data = zk.getData(ckptPath, false, s);
+			if (data == null || data.length == 0) {
+				System.out.println("[RECOVER] " + myID + " empty checkpoint, will replay all from ZooKeeper");
+				lastApplied = -1L;
+				return;
+			}
+
+			String sstr = new String(data, StandardCharsets.UTF_8);
+			String[] lines = sstr.split("\\r?\\n");
+			if (lines.length == 0) {
+				lastApplied = -1L;
+				return;
+			}
+
+			// Parse lastApplied from checkpoint
+			long checkpointLastApplied = -1L;
+			String first = lines[0].trim();
+			if (first.startsWith("lastApplied=")) {
+				try {
+					checkpointLastApplied = Long.parseLong(first.substring("lastApplied=".length()).trim());
+					System.out.println("[RECOVER] " + myID + " checkpoint has lastApplied=" + checkpointLastApplied);
+				} catch (NumberFormatException nfe) {
+					checkpointLastApplied = -1L;
+				}
+			}
+
+			// Restore and RE-APPLY operations from checkpoint to rebuild Cassandra state
+			if (lines.length > 1) {
+				TreeMap<Long, String> restored = new TreeMap<>();
+				for (int i = 1; i < lines.length; i++) {
+					String ln = lines[i].trim();
+					if (ln.isEmpty()) continue;
+					int sep = ln.indexOf('|');
+					if (sep <= 0) continue;
 					try {
-						lastApplied = Long.parseLong(sstr.trim());
-						log.log(Level.INFO, "Recovered checkpoint: lastApplied={0}", lastApplied);
-					} catch (NumberFormatException nfe) {
-						log.log(Level.WARNING, "Bad checkpoint value {0}", sstr);
+						long seq = Long.parseLong(ln.substring(0, sep));
+						byte[] payloadBytes = Base64.getDecoder().decode(ln.substring(sep + 1));
+						restored.put(seq, new String(payloadBytes, StandardCharsets.UTF_8));
+					} catch (Exception ignored) {}
+				}
+
+				if (!restored.isEmpty()) {
+					System.out.println("[RECOVER] " + myID + " re-applying " + restored.size() + " operations from checkpoint to Cassandra");
+
+					// Re-apply all checkpointed operations to Cassandra
+					for (Map.Entry<Long, String> e : restored.entrySet()) {
+						long seq = e.getKey();
+						String reqStr = e.getValue();
+
+						boolean success = applyRequestToCassandra(reqStr);
+						if (success) {
+							lastApplied = seq;
+						} else {
+							System.err.println("[RECOVER] " + myID + " FAILED to re-apply seq=" + seq);
+						}
 					}
+
+					// Restore log cache
+					synchronized (logCache) {
+						logCache.clear();
+						logCache.putAll(restored);
+					}
+
+					System.out.println("[RECOVER] " + myID + " recovery from checkpoint complete, lastApplied=" + lastApplied);
+				}
+			} else if (checkpointLastApplied >= 0) {
+				lastApplied = checkpointLastApplied;
+			}
+
+			// CRITICAL: After recovering from checkpoint, we MUST replay ALL operations
+			// from ZooKeeper that come AFTER our checkpoint, because those operations
+			// were committed to ZooKeeper but not yet checkpointed when we crashed
+			System.out.println("[RECOVER] " + myID + " will now replay unapplied operations from ZooKeeper (seq > " + lastApplied + ")");
+
+		} catch (Exception e) {
+			System.err.println("[RECOVER] " + myID + " failed: " + e.getMessage());
+			e.printStackTrace();
+			lastApplied = -1L; // Start from beginning if recovery fails
+		}
+	}
+
+	@Override
+	public void close() {
+		System.out.println("[CLOSE] " + myID + " shutting down, lastApplied=" + lastApplied);
+		super.close();
+		checkpointExecutor.shutdown();
+		try {
+			synchronized (processLock) {
+				if (lastApplied >= 0) {
+					checkpoint();
 				}
 			}
 		} catch (Exception e) {
-			log.log(Level.WARNING, "Failed to recover checkpoint: {0}", e.getMessage());
+			System.err.println("[CLOSE] " + myID + " final checkpoint failed: " + e.getMessage());
 		}
+		try { if (zk != null) zk.close(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+		try { if (session != null) session.close(); } catch (Exception ignored) {}
+		try { if (cluster != null) cluster.close(); } catch (Exception ignored) {}
+		System.out.println("[CLOSE] " + myID + " closed");
 	}
 
-	/**
-	 * Graceful shutdown: close zk and cassandra and messenger
-	 */
-	@Override
-	public void close() {
-		super.close();
-		try {
-			if (zk != null) zk.close();
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-		}
-		try {
-			if (session != null) session.close();
-		} catch (Exception ignored) {
-		}
-		try {
-			if (cluster != null) cluster.close();
-		} catch (Exception ignored) {
-		}
-		log.log(Level.INFO, "MyDBFaultTolerantServerZK {0} closed", myID);
-	}
-
-	/**
-	 * Main entrypoint expected by the grader harness.
-	 */
 	public static void main(String[] args) throws IOException {
 		NodeConfig<String> nc = NodeConfigUtils.getNodeConfigFromFile(args[0], ReplicatedServer.SERVER_PREFIX, ReplicatedServer.SERVER_PORT_OFFSET);
 		String myID = args[1];
 		InetSocketAddress isaDB = args.length > 2 ? Util.getInetSocketAddressFromString(args[2]) : new InetSocketAddress("localhost", 9042);
-		new server.faulttolerance.MyDBFaultTolerantServerZK(nc, myID, isaDB);
+		new MyDBFaultTolerantServerZK(nc, myID, isaDB);
 	}
 }
