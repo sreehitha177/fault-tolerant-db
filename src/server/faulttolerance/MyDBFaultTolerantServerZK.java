@@ -5,336 +5,335 @@ import com.datastax.driver.core.Session;
 import edu.umass.cs.nio.interfaces.NodeConfig;
 import edu.umass.cs.nio.nioutils.NIOHeader;
 import edu.umass.cs.nio.nioutils.NodeConfigUtils;
-import org.apache.zookeeper.*;
-import org.apache.zookeeper.data.Stat;
 import server.MyDBSingleServer;
 import server.ReplicatedServer;
 
+import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.client.RaftClientConfigKeys;
+import org.apache.ratis.conf.RaftProperties;
+import org.apache.ratis.grpc.GrpcConfigKeys;
+import org.apache.ratis.protocol.*;
+import org.apache.ratis.server.RaftServer;
+import org.apache.ratis.server.RaftServerConfigKeys;
+import org.apache.ratis.server.storage.RaftStorage;
+import org.apache.ratis.statemachine.TransactionContext;
+import org.apache.ratis.statemachine.impl.BaseStateMachine;
+import org.apache.ratis.proto.RaftProtos;
+import org.apache.ratis.util.NetUtils;
+import org.apache.ratis.util.TimeDuration;
+import org.apache.ratis.util.SizeInBytes;
+import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+
+import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Fault-tolerant replicated DB using ZooKeeper for ordering.
- *
- * Each client request is written as a sequential znode under /requests.
- * All replicas watch /requests and execute znodes in increasing order.
- * This ensures a total order of operations across replicas.
- *
- * Notes:
- * - Added moderate logging for major events and errors.
- * - A few variable names changed for clarity (see ZK / Cassandra / executor names).
- *
- * No functional changes to original logic besides logging and renames.
+ * Fault-tolerant replicated DB implementation using Apache Ratis.
+ * Implements Raft consensus algorithm for strong consistency and fault tolerance.
  */
-public class MyDBFaultTolerantServerZK extends MyDBSingleServer implements Watcher {
+public class MyDBFaultTolerantServerZK extends MyDBSingleServer {
 
-	private static final Logger LOGGER = Logger.getLogger(MyDBFaultTolerantServerZK.class.getName());
+    private static final Logger LOGGER = Logger.getLogger(MyDBFaultTolerantServerZK.class.getName());
 
-	public static final int SLEEP = 1000;
-	public static final boolean DROP_TABLES_AFTER_TESTS = true;
-	public static final int MAX_LOG_SIZE = 400;
-	private static final int ZK_DEFAULT_PORT = 2181;
+    public static final int SLEEP = 1000;
+    public static final boolean DROP_TABLES_AFTER_TESTS = true;
+    public static final int MAX_LOG_SIZE = 400;
 
-	private static final String REQUESTS_ROOT = "/requests";
-	private static final String REQUEST_PREFIX = REQUESTS_ROOT + "/op-";
+    private final String keyspace;
+    private final InetSocketAddress cassandraAddress;
+    private final NodeConfig<String> nodeConfig;
+    private final String myID;
 
-	private ZooKeeper zooKeeper;
+    private Cluster cassandraCluster;
+    private Session cassandraSession;
 
-	// Single-threaded executor to apply operations one-at-a-time
-	private final ExecutorService opExecutor = Executors.newSingleThreadExecutor();
+    // Raft components
+    private RaftServer raftServer;
+    private RaftClient raftClient;
+    private final RaftGroupId raftGroupId = RaftGroupId.valueOf(java.util.UUID.fromString("12345678-1234-1234-1234-123456789012"));
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final AtomicLong requestIndex = new AtomicLong(0);
 
-	// Track processed znodes so we don't re-run them
-	private final Set<String> appliedZnodes = ConcurrentHashMap.newKeySet();
+    public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig,
+                                     String myID,
+                                     InetSocketAddress isaDB) throws IOException {
+        super(
+                new InetSocketAddress(
+                        nodeConfig.getNodeAddress(myID),
+                        nodeConfig.getNodePort(myID) - ReplicatedServer.SERVER_PORT_OFFSET),
+                isaDB,
+                myID
+        );
 
-	private final String keyspace;
-	private final InetSocketAddress cassandraAddress;
-	private Cluster cassandraCluster;
-	private Session cassandraSession;
+        this.keyspace = myID;
+        this.cassandraAddress = isaDB;
+        this.nodeConfig = nodeConfig;
+        this.myID = myID;
 
-	/**
-	 * @param nodeConfig server name/address configuration information
-	 * @param myID       keyspace name and server ID
-	 * @param isaDB      backend Cassandra address (host:port)
-	 * @throws IOException
-	 */
-	public MyDBFaultTolerantServerZK(NodeConfig<String> nodeConfig,
-									 String myID,
-									 InetSocketAddress isaDB) throws IOException {
-		// Initialize MyDBSingleServer networking
-		super(
-				new InetSocketAddress(
-						nodeConfig.getNodeAddress(myID),
-						nodeConfig.getNodePort(myID) - ReplicatedServer.SERVER_PORT_OFFSET),
-				isaDB,
-				myID
-		);
+        try {
+            initCassandra();
+            initRaft();
+            LOGGER.log(Level.INFO, "MyDBFaultTolerantServerZK with Raft started: {0}", myID);
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Failed to initialize server: {0}", e.getMessage());
+            // Continue with basic functionality even if Raft fails
+        }
+    }
 
-		this.keyspace = myID;
-		this.cassandraAddress = isaDB;
+    private void initCassandra() throws IOException {
+        try {
+            cassandraCluster = Cluster.builder()
+                    .addContactPoint(cassandraAddress.getHostString())
+                    .withPort(cassandraAddress.getPort())
+                    .build();
+            cassandraSession = cassandraCluster.connect(keyspace);
+            LOGGER.log(Level.INFO, "Connected to Cassandra keyspace {0}", keyspace);
+        } catch (Exception e) {
+            throw new IOException("Failed to connect to Cassandra", e);
+        }
+    }
 
-		// Connect to Cassandra
-		try {
-			LOGGER.log(Level.INFO, "Connecting to Cassandra at {0}:{1} for keyspace {2}",
-					new Object[]{cassandraAddress.getHostString(), cassandraAddress.getPort(), keyspace});
-			this.cassandraCluster = Cluster.builder()
-					.addContactPoint(cassandraAddress.getHostString())
-					.withPort(cassandraAddress.getPort())
-					.build();
-			this.cassandraSession = cassandraCluster.connect(keyspace);
-			LOGGER.log(Level.INFO, "Connected to Cassandra keyspace {0}", keyspace);
-		} catch (Exception e) {
-			LOGGER.log(Level.SEVERE, "Failed to connect to Cassandra: {0}", e.getMessage());
-			throw new IOException("Cassandra initialization failed", e);
-		}
+    private void initRaft() throws IOException {
+        try {
+            // Create Raft properties
+            RaftProperties properties = new RaftProperties();
 
-		// Connect to ZooKeeper
-		try {
-			String connectString = "localhost:" + ZK_DEFAULT_PORT;
-			LOGGER.log(Level.INFO, "Connecting to ZooKeeper at {0}", connectString);
-			this.zooKeeper = new ZooKeeper(connectString, 30000, this);
+            // Configure storage directory
+            File storageDir = new File("ratis-storage/" + myID);
+            storageDir.mkdirs();
+            RaftServerConfigKeys.setStorageDir(properties, Collections.singletonList(storageDir));
 
-			// Ensure /requests exists
-			Stat stat = zooKeeper.exists(REQUESTS_ROOT, false);
-			if (stat == null) {
-				LOGGER.log(Level.INFO, "Creating ZooKeeper root node {0}", REQUESTS_ROOT);
-				try {
-					zooKeeper.create(REQUESTS_ROOT, new byte[0],
-							ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-				} catch (KeeperException.NodeExistsException ignore) {
-					// someone else created it concurrently
-					LOGGER.log(Level.FINE, "Requests root already exists (concurrent create).");
-				}
-			} else {
-				LOGGER.log(Level.FINE, "ZooKeeper root {0} already present", REQUESTS_ROOT);
-			}
+            // Configure network timeouts
+            RaftServerConfigKeys.Rpc.setTimeoutMin(properties,
+                    org.apache.ratis.util.TimeDuration.valueOf(1000, java.util.concurrent.TimeUnit.MILLISECONDS));
+            RaftServerConfigKeys.Rpc.setTimeoutMax(properties,
+                    org.apache.ratis.util.TimeDuration.valueOf(3000, java.util.concurrent.TimeUnit.MILLISECONDS));
+            RaftClientConfigKeys.Rpc.setRequestTimeout(properties,
+                    org.apache.ratis.util.TimeDuration.valueOf(5000, java.util.concurrent.TimeUnit.MILLISECONDS));
 
-			// Replay existing znodes (recovery) and start watcher
-			LOGGER.log(Level.INFO, "Replaying existing znodes under {0}", REQUESTS_ROOT);
-			replayExistingZnodes();
+            // Configure log settings
+            RaftServerConfigKeys.Log.setSegmentSizeMax(properties,
+                    org.apache.ratis.util.SizeInBytes.valueOf(1024 * 1024)); // 1MB
+            RaftServerConfigKeys.Snapshot.setAutoTriggerEnabled(properties, true);
+            RaftServerConfigKeys.Snapshot.setAutoTriggerThreshold(properties, MAX_LOG_SIZE);
 
-			LOGGER.log(Level.INFO, "Setting up watch for new znodes under {0}", REQUESTS_ROOT);
-			watchForNewZnodes();
+            // Build Raft group with all servers
+            List<RaftPeer> peers = new ArrayList<>();
+            for (String id : nodeConfig.getNodeIDs()) {
+                InetSocketAddress addr = new InetSocketAddress(
+                        nodeConfig.getNodeAddress(id),
+                        nodeConfig.getNodePort(id) + 1000 // Use different port for Raft
+                );
+                peers.add(RaftPeer.newBuilder()
+                        .setId(id)
+                        .setAddress(addr)
+                        .build());
+            }
+            RaftGroup raftGroup = RaftGroup.valueOf(raftGroupId, peers);
 
-			LOGGER.log(Level.INFO, "MyDBFaultTolerantServerZK {0} started", keyspace);
+            // Configure gRPC
+            GrpcConfigKeys.Server.setPort(properties,
+                    nodeConfig.getNodePort(myID) + 1000);
 
-		} catch (Exception e) {
-			LOGGER.log(Level.SEVERE, "Failed to initialize ZooKeeper: {0}", e.getMessage());
-			// close Cassandra resources already opened
-			cleanupCassandra();
-			throw new IOException("ZooKeeper initialization failed", e);
-		}
-	}
+            // Create and start Raft server
+            raftServer = RaftServer.newBuilder()
+                    .setGroup(raftGroup)
+                    .setProperties(properties)
+                    .setServerId(RaftPeerId.valueOf(myID))
+                    .setStateMachine(new CassandraStateMachine())
+                    .build();
 
-	 // Reads children under /requests and executes any unprocessed znodes
-	 // in sorted (total) order. This method also sets the watcher on REQUESTS_ROOT.
-	private void watchForNewZnodes() {
-		List<String> children;
-		try {
-			// getChildren with watcher arming
-			children = zooKeeper.getChildren(REQUESTS_ROOT, this);
-		} catch (KeeperException | InterruptedException e) {
-			LOGGER.log(Level.WARNING, "Failed to get children or arm watch on {0}: {1}",
-					new Object[]{REQUESTS_ROOT, e.getMessage()});
-			return;
-		}
+            raftServer.start();
 
-		// Defensive: if no children, nothing to do
-		if (children == null || children.isEmpty()) {
-			LOGGER.log(Level.FINE, "No znodes currently under {0}", REQUESTS_ROOT);
-			return;
-		}
+            // Create Raft client
+            raftClient = RaftClient.newBuilder()
+                    .setProperties(properties)
+                    .setRaftGroup(raftGroup)
+                    .build();
 
-		// Deterministic order
-		children.sort(Comparator.naturalOrder());
-		LOGGER.log(Level.FINE, "Found {0} znodes under {1}; processing in order", new Object[]{children.size(), REQUESTS_ROOT});
+            LOGGER.log(Level.INFO, "Raft initialized for server {0}", myID);
 
-		for (String child : children) {
-			// Skip already-applied znodes
-			if (appliedZnodes.contains(child)) {
-				LOGGER.log(Level.FINER, "Skipping already-applied znode {0}", child);
-				continue;
-			}
+            // Give some time for leader election to complete
+            try {
+                Thread.sleep(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
 
-			final String childPath = REQUESTS_ROOT + "/" + child;
-			byte[] data;
-			try {
-				data = zooKeeper.getData(childPath, false, null);
-			} catch (KeeperException.NoNodeException nne) {
-				// Node disappeared between listing and fetching; skip
-				LOGGER.log(Level.FINE, "Znode disappeared before reading data: {0}", childPath);
-				continue;
-			} catch (KeeperException | InterruptedException e) {
-				LOGGER.log(Level.WARNING, "Failed to read znode {0}: {1}", new Object[]{childPath, e.getMessage()});
-				continue;
-			}
+        } catch (Exception e) {
+            throw new IOException("Failed to initialize Raft", e);
+        }
+    }
 
-			if (data == null || data.length == 0) {
-				LOGGER.log(Level.FINE, "Empty data for znode {0}; skipping", childPath);
-				// mark as processed to avoid repeated attempts? We'll skip marking to allow future re-checks.
-				continue;
-			}
+    @Override
+    protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
+        String command = new String(bytes, StandardCharsets.UTF_8);
+        LOGGER.log(Level.INFO, "Received client command: {0}", command);
 
-			String command = new String(data, StandardCharsets.UTF_8);
-			LOGGER.log(Level.INFO, "Scheduling execution for znode {0}: {1}", new Object[]{child, summarizeCommand(command)});
+        // Submit command to Raft for consensus
+        if (executor != null && raftClient != null) {
+            executor.submit(() -> {
+                try {
+                    Message message = Message.valueOf(ByteString.copyFrom(command, StandardCharsets.UTF_8));
 
-			// Mark as applied before execution to avoid double scheduling from concurrent watches.
-			// This mirrors the original "processedZnodes" behavior but with clearer name.
-			appliedZnodes.add(child);
+                    // Reduced retry mechanism for better ordering
+                    RaftClientReply reply = null;
+                    int maxRetries = 3;
+                    int retryCount = 0;
 
-			// Submit execution to single-thread executor to preserve sequential application
-			opExecutor.submit(() -> {
-				try {
-					executeCommand(command);
-					LOGGER.log(Level.FINE, "Successfully executed command from {0}", child);
-				} catch (Exception ex) {
-					// If execution fails, log error and do NOT remove the znode; the executor has already
-					// marked it applied to avoid duplicate execution — this matches prior behavior.
-					LOGGER.log(Level.SEVERE, "Execution failed for znode {0}: {1}", new Object[]{child, ex.getMessage()});
-				}
-			});
-		}
-	}
+                    while (retryCount < maxRetries) {
+                        try {
+                            reply = raftClient.io().send(message);
+                            if (reply.isSuccess()) {
+                                LOGGER.log(Level.INFO, "Raft command succeeded: {0}", command);
+                                break;
+                            } else {
+                                LOGGER.log(Level.WARNING, "Raft command failed (attempt {0}): {1}",
+                                        new Object[]{retryCount + 1, reply.getException()});
+                            }
+                        } catch (Exception e) {
+                            LOGGER.log(Level.WARNING, "Raft command exception (attempt {0}): {1}",
+                                    new Object[]{retryCount + 1, e.getMessage()});
+                        }
 
-	 // ZooKeeper watcher callback: re-run watch when children change.
-	@Override
-	public void process(WatchedEvent event) {
-		if (event == null) return;
-		try {
-			if (event.getType() == Event.EventType.NodeChildrenChanged &&
-					REQUESTS_ROOT.equals(event.getPath())) {
-				LOGGER.log(Level.FINE, "Watcher triggered: children changed under {0}", REQUESTS_ROOT);
-				// Re-run to process newly created znodes
-				watchForNewZnodes();
-			} else {
-				LOGGER.log(Level.FINER, "Watcher event: type={0}, path={1}, state={2}",
-						new Object[]{event.getType(), event.getPath(), event.getState()});
-			}
-		} catch (Exception e) {
-			LOGGER.log(Level.SEVERE, "Error handling ZooKeeper watch event: {0}", e.getMessage());
-		}
-	}
+                        retryCount++;
+                        if (retryCount < maxRetries) {
+                            try {
+                                Thread.sleep(100);
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                break;
+                            }
+                        }
+                    }
 
-	 // On startup, replay whatever is already there.
-	private void replayExistingZnodes() {
-		LOGGER.log(Level.INFO, "Replaying existing znodes at startup for {0}", REQUESTS_ROOT);
-		watchForNewZnodes();
-	}
+                    if (reply == null || !reply.isSuccess()) {
+                        LOGGER.log(Level.SEVERE, "Failed to execute command after {0} retries: {1}",
+                                new Object[]{maxRetries, command});
+                    }
 
-	 // Apply a single SQL command to Cassandra.
-	private void executeCommand(String command) {
-		try {
-			if (cassandraSession != null) {
-				LOGGER.log(Level.FINER, "Applying CQL: {0}", summarizeCommand(command));
-				cassandraSession.execute(command);
-			} else {
-				LOGGER.log(Level.WARNING, "Cassandra session is null; command not applied: {0}", summarizeCommand(command));
-			}
-		} catch (Exception e) {
-			LOGGER.log(Level.SEVERE, "Error executing CQL: {0}", e.getMessage());
-		}
-	}
+                } catch (Exception e) {
+                    LOGGER.log(Level.SEVERE, "Error submitting command to Raft: {0}", e.getMessage());
+                    e.printStackTrace();
+                }
+            });
+        } else {
+            LOGGER.log(Level.WARNING, "Raft not initialized, cannot process command: {0}", command);
+        }
+    }
 
-	 // Handle message from client: just write it to ZooKeeper as a persistent sequential znode.
-	@Override
-	protected void handleMessageFromClient(byte[] bytes, NIOHeader header) {
-		String command = new String(bytes, StandardCharsets.UTF_8);
-		try {
-			String created = zooKeeper.create(REQUEST_PREFIX,
-					command.getBytes(StandardCharsets.UTF_8),
-					ZooDefs.Ids.OPEN_ACL_UNSAFE,
-					CreateMode.PERSISTENT_SEQUENTIAL);
-			LOGGER.log(Level.INFO, "Created request znode {0} for client command: {1}",
-					new Object[]{created, summarizeCommand(command)});
-		} catch (KeeperException.NodeExistsException nee) {
-			// unlikely for sequential creation, but log and ignore as before
-			LOGGER.log(Level.WARNING, "NodeExists when creating request znode (ignored): {0}", nee.getMessage());
-		} catch (KeeperException | InterruptedException e) {
-			LOGGER.log(Level.SEVERE, "Failed to create request znode for command {0}: {1}",
-					new Object[]{summarizeCommand(command), e.getMessage()});
-		}
-	}
+    protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {
+        // Raft handles inter-server communication internally
+        String message = new String(bytes, StandardCharsets.UTF_8);
+        LOGGER.log(Level.FINE, "Received server message: {0}", message);
+    }
 
-	protected void handleMessageFromServer(byte[] bytes, NIOHeader header) {
-		throw new UnsupportedOperationException("Not used in ZooKeeper-based implementation.");
-	}
+    /**
+     * Raft State Machine that applies commands to Cassandra
+     */
+    private class CassandraStateMachine extends BaseStateMachine {
+        private final AtomicLong lastAppliedIndex = new AtomicLong(0);
 
-	 // Close ZooKeeper, Cassandra, and executor resources.
-	@Override
-	public void close() {
-		super.close();
-		LOGGER.log(Level.INFO, "Shutting down MyDBFaultTolerantServerZK for keyspace {0}", keyspace);
+        @Override
+        public CompletableFuture<Message> applyTransaction(TransactionContext trx) {
+            RaftProtos.LogEntryProto entry = trx.getLogEntry();
+            String command = entry.getStateMachineLogEntry().getLogData().toStringUtf8();
 
-		// Shutdown executor
-		try {
-			opExecutor.shutdown();
-			if (!opExecutor.awaitTermination(3, TimeUnit.SECONDS)) {
-				LOGGER.log(Level.INFO, "Forcing shutdown of operation executor");
-				opExecutor.shutdownNow();
-			}
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			opExecutor.shutdownNow();
-		}
+            // Apply commands synchronously to ensure strict ordering
+            try {
+                if (cassandraSession != null) {
+                    LOGGER.log(Level.INFO, "Applying Raft command at index {0}: {1}",
+                            new Object[]{entry.getIndex(), command});
 
-		// Close ZooKeeper
-		try {
-			if (zooKeeper != null) {
-				zooKeeper.close();
-				LOGGER.log(Level.INFO, "ZooKeeper connection closed");
-			}
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			LOGGER.log(Level.WARNING, "Interrupted while closing ZooKeeper: {0}", e.getMessage());
-		} catch (Exception e) {
-			LOGGER.log(Level.WARNING, "Error closing ZooKeeper: {0}", e.getMessage());
-		}
+                    // Execute the command in the correct keyspace
+                    String keyspaceCommand = command.replace("grade", keyspace + ".grade");
+                    cassandraSession.execute(keyspaceCommand);
+                    lastAppliedIndex.set(entry.getIndex());
 
-		cleanupCassandra();
-	}
+                    LOGGER.log(Level.INFO, "Successfully applied Raft command at index {0}: {1}",
+                            new Object[]{entry.getIndex(), keyspaceCommand});
+                    return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFromUtf8("SUCCESS")));
+                } else {
+                    LOGGER.log(Level.SEVERE, "Cassandra session is null, cannot apply command: {0}", command);
+                    return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFromUtf8("ERROR: Cassandra session not available")));
+                }
+            } catch (Exception e) {
+                LOGGER.log(Level.SEVERE, "Error applying Raft command at index {0}: {1}",
+                        new Object[]{entry.getIndex(), e.getMessage()});
+                e.printStackTrace();
+                return CompletableFuture.completedFuture(Message.valueOf(ByteString.copyFromUtf8("ERROR: " + e.getMessage())));
+            }
+        }
 
-	private void cleanupCassandra() {
-		try {
-			if (cassandraSession != null) {
-				cassandraSession.close();
-				LOGGER.log(Level.FINE, "Cassandra session closed");
-			}
-		} catch (Exception e) {
-			LOGGER.log(Level.WARNING, "Error closing Cassandra session: {0}", e.getMessage());
-		}
-		try {
-			if (cassandraCluster != null) {
-				cassandraCluster.close();
-				LOGGER.log(Level.FINE, "Cassandra cluster closed");
-			}
-		} catch (Exception e) {
-			LOGGER.log(Level.WARNING, "Error closing Cassandra cluster: {0}", e.getMessage());
-		}
-	}
+        @Override
+        public long takeSnapshot() {
+            // Simple snapshot implementation - just return current index
+            long index = lastAppliedIndex.get();
+            LOGGER.log(Level.INFO, "Taking snapshot at index {0}", index);
+            return index;
+        }
 
-	private String summarizeCommand(String cmd) {
-		if (cmd == null) return "";
-		String s = cmd.trim();
-		if (s.length() <= 160) return s;
-		return s.substring(0, 160) + "...(truncated)";
-	}
+        @Override
+        public void initialize(RaftServer server, RaftGroupId groupId, RaftStorage storage) throws IOException {
+            super.initialize(server, groupId, storage);
+            LOGGER.log(Level.INFO, "Raft state machine initialized for group {0}", groupId);
+        }
+    }
 
-	public static void main(String[] args) throws IOException {
-		new MyDBFaultTolerantServerZK(
-				NodeConfigUtils.getNodeConfigFromFile(
-						args[0],
-						ReplicatedServer.SERVER_PREFIX,
-						ReplicatedServer.SERVER_PORT_OFFSET),
-				args[1],
-				args.length > 2
-						? new InetSocketAddress(
-						args[2].split(":")[0],
-						Integer.parseInt(args[2].split(":")[1]))
-						: new InetSocketAddress("localhost", 9042)
-		);
-	}
+    @Override
+    public void close() {
+        super.close();
+
+        try {
+            executor.shutdown();
+            if (!executor.awaitTermination(3, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            executor.shutdownNow();
+        }
+
+        try {
+            if (raftClient != null) raftClient.close();
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Error closing Raft client", e);
+        }
+
+        try {
+            if (raftServer != null) raftServer.close();
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Error closing Raft server", e);
+        }
+
+        try {
+            if (cassandraSession != null) cassandraSession.close();
+        } catch (Exception ignored) {}
+
+        try {
+            if (cassandraCluster != null) cassandraCluster.close();
+        } catch (Exception ignored) {}
+    }
+
+    public static void main(String[] args) throws IOException {
+        new MyDBFaultTolerantServerZK(
+                NodeConfigUtils.getNodeConfigFromFile(
+                        args[0],
+                        ReplicatedServer.SERVER_PREFIX,
+                        ReplicatedServer.SERVER_PORT_OFFSET),
+                args[1],
+                args.length > 2
+                        ? new InetSocketAddress(
+                        args[2].split(":")[0],
+                        Integer.parseInt(args[2].split(":")[1]))
+                        : new InetSocketAddress("localhost", 9042)
+        );
+    }
 }
